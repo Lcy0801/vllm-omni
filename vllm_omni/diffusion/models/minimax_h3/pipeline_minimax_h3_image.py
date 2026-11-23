@@ -373,6 +373,9 @@ class MiniMaxH3ImagePipeline(
         )
         self.num_steps = len(self.pdd_sigmas) - 1
         additional = od_config.additional_config or {}
+        cache_mb = additional.get("image_vae_moments_cache_mb", 0)
+        if type(cache_mb) is not int or not 0 <= cache_mb <= 1024:
+            raise ValueError(f"image_vae_moments_cache_mb must be an integer in [0, 1024], got {cache_mb!r}")
         self.min_generation_area: int | None = additional.get(
             "min_generation_area", MINIMAX_H3_IMAGE_DEFAULT_MIN_GENERATION_AREA
         )
@@ -456,6 +459,10 @@ class MiniMaxH3ImagePipeline(
         # agreement with the reference (MiniMaxH3Qwen3VLEncoder.cudnn_sdp).
         self.text_encoder.cudnn_sdp = cudnn_sdp
         self.vae = MiniMaxH3ImageVAE.from_pretrained(root / "vae").to(self.device)
+        # Tile-parallel encode uses collectives, which require identical calls
+        # on every rank; rank-local hits cannot safely skip them.
+        if self._vae_group is None:
+            self.vae.configure_moments_cache(cache_mb * 1024 * 1024)
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=od_config.enable_diffusion_pipeline_profiler
         )

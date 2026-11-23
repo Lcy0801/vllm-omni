@@ -16,8 +16,11 @@ single frame, so this module keeps only the image paths of the released VAE:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
+import threading
+from collections import OrderedDict
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -405,6 +408,76 @@ class MiniMaxH3ImageVAE(nn.Module):
         )
         self.register_buffer("pixel_mean", torch.tensor(_IMAGENET_MEAN, dtype=fp32).view(1, 3, 1, 1), persistent=False)
         self.register_buffer("pixel_std", torch.tensor(_IMAGENET_STD, dtype=fp32).view(1, 3, 1, 1), persistent=False)
+        # CPU copies avoid pinning GPU memory and cross-stream reuse of unfinished writes.
+        # Disabled by default; the pipeline opts in only on a single VAE rank.
+        self._moments_cache_limit = 0
+        self._moments_cache_bytes = 0
+        self._moments_cache: OrderedDict[bytes, torch.Tensor] = OrderedDict()
+        self._moments_cache_signature: tuple[Any, ...] | None = None
+        self._moments_cache_lock = threading.Lock()
+
+    def configure_moments_cache(self, max_bytes: int) -> None:
+        """Bound the RGB-image posterior-moments cache; zero disables it."""
+        if type(max_bytes) is not int or max_bytes < 0:
+            raise ValueError("max_bytes must be a non-negative integer")
+        with self._moments_cache_lock:
+            self._moments_cache_limit = max_bytes
+            self._clear_moments_cache()
+
+    def _clear_moments_cache(self) -> None:
+        """Clear under ``_moments_cache_lock`` (or before exposing the module)."""
+        self._moments_cache.clear()
+        self._moments_cache_bytes = 0
+        self._moments_cache_signature = None
+
+    def _apply(self, fn):
+        result = super()._apply(fn)
+        if hasattr(self, "_moments_cache_lock"):
+            with self._moments_cache_lock:
+                self._clear_moments_cache()
+        return result
+
+    def _encoder_signature(self) -> tuple[Any, ...]:
+        # A changed weight, statistic, dtype, device or tile policy invalidates
+        # *all* entries. _version catches ordinary in-place parameter updates.
+        tensors = (
+            *self.encoder.parameters(),
+            *self.encoder.buffers(),
+            *self.quant_conv.parameters(),
+            *self.quant_conv.buffers(),
+            self.pixel_mean,
+            self.pixel_std,
+        )
+        return (
+            self.encoder_tiling,
+            self.tile_size,
+            self.tile_overlap_min,
+            tuple((id(t), t._version, t.data_ptr(), t.device, t.dtype) for t in tensors),
+        )
+
+    def _get_cached_moments(self, key: bytes, signature: tuple[Any, ...]) -> torch.Tensor | None:
+        with self._moments_cache_lock:
+            if signature != self._moments_cache_signature:
+                self._clear_moments_cache()
+                self._moments_cache_signature = signature
+            moments = self._moments_cache.get(key)
+            if moments is not None:
+                self._moments_cache.move_to_end(key)
+            return moments
+
+    def _put_cached_moments(self, key: bytes, signature: tuple[Any, ...], moments: torch.Tensor) -> None:
+        size = moments.numel() * moments.element_size()
+        with self._moments_cache_lock:
+            # A concurrent reconfiguration/invalidation must not repopulate an old cache.
+            if signature != self._moments_cache_signature or not self._moments_cache_limit:
+                return
+            if size > self._moments_cache_limit or key in self._moments_cache:
+                return
+            while self._moments_cache_bytes + size > self._moments_cache_limit:
+                _, evicted = self._moments_cache.popitem(last=False)
+                self._moments_cache_bytes -= evicted.numel() * evicted.element_size()
+            self._moments_cache[key] = moments
+            self._moments_cache_bytes += size
 
     @classmethod
     def from_pretrained(cls, path: str | Path) -> MiniMaxH3ImageVAE:
@@ -464,18 +537,44 @@ class MiniMaxH3ImageVAE(nn.Module):
         import numpy as np
 
         array = np.array(image.convert("RGB") if hasattr(image, "convert") else image, dtype=np.uint8)
-        pixels = torch.from_numpy(array).to(self.device)[None].permute(0, 3, 1, 2).to(torch.float32).div_(255.0)
-        pixels = (pixels - self.pixel_mean) / self.pixel_std
         ratio = MINIMAX_H3_IMAGE_VAE_RATIO
-        height, width = pixels.shape[-2] // ratio * ratio, pixels.shape[-1] // ratio * ratio
+        height, width = array.shape[:2]
+        height, width = height // ratio * ratio, width // ratio * ratio
         if height == 0 or width == 0:
             raise ValueError("image must be at least 16 pixels on each axis")
-        pixels = pixels[:, :, :height, :width].unsqueeze(2)
-        if self.encoder_tiling:
-            moments = self._tiled(pixels, self._encode_moments, latent_in=False, group=group)
+
+        # Grouped tiling has collectives: every rank must encode every reference,
+        # even if another rank has already cached it. Training/autocast can alter
+        # the encoded value; do not mix those contexts with inference entries.
+        cache_enabled = (
+            self._moments_cache_limit > 0
+            and group is None
+            and not self.training
+            and not torch.is_autocast_enabled(self.device.type)
+        )
+        key = None
+        if cache_enabled:
+            signature = self._encoder_signature()
+            key = hashlib.sha256(array.tobytes() + str(array.shape).encode()).digest()
+            cached = self._get_cached_moments(key, signature)
         else:
-            moments = self._encode_moments(pixels)
-        moments = moments.to(torch.float32)
+            cached = None
+        if cached is not None:
+            moments = cached.to(self.device)
+        else:
+            pixels = torch.from_numpy(array).to(self.device)[None].permute(0, 3, 1, 2).to(torch.float32).div_(255.0)
+            pixels = (pixels - self.pixel_mean) / self.pixel_std
+            pixels = pixels[:, :, :height, :width].unsqueeze(2)
+            if self.encoder_tiling:
+                moments = self._tiled(pixels, self._encode_moments, latent_in=False, group=group)
+            else:
+                moments = self._encode_moments(pixels)
+            moments = moments.to(torch.float32)
+            if key is not None:
+                # Blocking D2H copy completes the producer stream before publishing.
+                snapshot = moments.to("cpu", copy=True)
+                if signature == self._encoder_signature():
+                    self._put_cached_moments(key, signature, snapshot)
         mean, logvar = torch.chunk(moments, 2, dim=1)
         std = logvar.clamp(-30.0, 20.0).mul(0.5).exp_()
         noise = torch.randn(mean.shape, generator=generator, device=generator.device).to(mean.device)

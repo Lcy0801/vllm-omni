@@ -303,6 +303,128 @@ def test_vae_round_trip_shapes_and_fp32_statistics(tmp_path):
     assert pixels.dtype == torch.float32 and 0.0 <= pixels.min() and pixels.max() <= 1.0
 
 
+def test_vae_moments_cache_preserves_sampling_and_invalidates(monkeypatch):
+    from PIL import Image
+
+    config = _tiny_vae_config()
+    config["vae_encoder_tiling"] = 0
+    vae = image_vae.MiniMaxH3ImageVAE(config).eval()
+    image = Image.new("RGB", (32, 32), (55, 89, 144))
+    different = Image.new("RGB", (32, 32), (56, 89, 144))
+    calls = 0
+    encode = vae._encode_moments
+
+    def counted(pixels):
+        nonlocal calls
+        calls += 1
+        return encode(pixels)
+
+    monkeypatch.setattr(vae, "_encode_moments", counted)
+
+    def sample(img, seed, **kw):
+        return vae.encode_image_latent(img, generator=torch.Generator().manual_seed(seed), **kw)
+
+    baseline = [sample(image, seed) for seed in (1, 2)]
+    assert calls == 2  # default is disabled
+    vae.configure_moments_cache(1024 * 1024)
+    for seed, expected in zip((1, 2), baseline):
+        assert torch.equal(sample(image, seed), expected)
+    assert calls == 3  # only the first cache access encodes
+    assert not torch.equal(baseline[0], baseline[1])
+    # A hit must consume exactly the same request RNG stream as a miss.
+    vae.configure_moments_cache(0)
+    uncached_rng = torch.Generator().manual_seed(7)
+    uncached = vae.encode_image_latent(image, generator=uncached_rng)
+    uncached_state = uncached_rng.get_state()
+    vae.configure_moments_cache(1024 * 1024)
+    sample(image, 7)  # prime
+    cached_rng = torch.Generator().manual_seed(7)
+    cached = vae.encode_image_latent(image, generator=cached_rng)
+    assert torch.equal(cached, uncached)
+    assert torch.equal(cached_rng.get_state(), uncached_state)
+    assert len(vae._moments_cache) == 1
+    sample(different, 1)
+    assert calls == 6  # different RGB pixels
+    vae.tile_size += 16
+    sample(image, 1)
+    assert calls == 7  # tiling policy invalidates
+    with torch.no_grad():
+        vae.quant_conv.bias.add_(1)
+    sample(image, 1)
+    assert calls == 8  # in-place encoder weight change invalidates
+    vae.to(dtype=torch.float64)
+    assert not vae._moments_cache  # device/dtype migration clears entries
+    vae.configure_moments_cache(0)
+    assert not vae._moments_cache
+
+
+def test_vae_moments_cache_lru_and_collective_bypass(monkeypatch):
+    from PIL import Image
+
+    config = _tiny_vae_config()
+    config["vae_encoder_tiling"] = 0
+    vae = image_vae.MiniMaxH3ImageVAE(config).eval()
+    calls = 0
+    encode = vae._encode_moments
+
+    def counted(pixels):
+        nonlocal calls
+        calls += 1
+        return encode(pixels)
+
+    monkeypatch.setattr(vae, "_encode_moments", counted)
+    image_a = Image.new("RGB", (32, 32), "red")
+    image_b = Image.new("RGB", (32, 32), "blue")
+
+    def sample(img, **kw):
+        return vae.encode_image_latent(img, generator=torch.Generator().manual_seed(11), **kw)
+
+    # Each 32x32 posterior is [1, 48, 1, 2, 2] in float32.
+    vae.configure_moments_cache(48 * 2 * 2 * 4)
+    sample(image_a)
+    sample(image_b)
+    assert len(vae._moments_cache) == 1
+    sample(image_a)
+    assert calls == 3  # a was evicted
+    sample(image_a, group=object())
+    assert calls == 4  # non-None group must encode (rank collectives)
+    vae.train()
+    sample(image_a)
+    assert calls == 5  # training bypasses the cache
+    vae.eval()
+    sample(image_a)
+    assert calls == 5  # bypasses leave the inference entry intact
+
+
+def test_vae_moments_cache_concurrent_misses_respect_budget(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+
+    from PIL import Image
+
+    config = _tiny_vae_config()
+    config["vae_encoder_tiling"] = 0
+    vae = image_vae.MiniMaxH3ImageVAE(config).eval()
+    # Isolate the cache synchronization from expensive convolution kernels.
+    monkeypatch.setattr(
+        vae,
+        "_encode_moments",
+        lambda pixels: pixels.new_zeros((1, 48, 1, pixels.shape[-2] // 16, pixels.shape[-1] // 16)),
+    )
+    one_entry = 48 * 2 * 2 * 4
+    vae.configure_moments_cache(one_entry)
+    images = [Image.new("RGB", (32, 32), (i, 0, 0)) for i in range(8)]
+
+    def run(index):
+        return vae.encode_image_latent(images[index % 8], generator=torch.Generator().manual_seed(index))
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        actual = list(pool.map(run, range(32)))
+    assert vae._moments_cache_bytes <= one_entry
+    assert len(vae._moments_cache) <= 1
+    vae.configure_moments_cache(0)
+    assert all(torch.equal(value, run(i)) for i, value in enumerate(actual))
+
+
 def test_prepare_decoder_weights_keeps_fp32_rope_bases():
     with torch.device("cpu"):
         vae = image_vae.MiniMaxH3ImageVAE(_tiny_vae_config())
